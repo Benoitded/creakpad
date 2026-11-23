@@ -16,7 +16,7 @@ creakpad plugs one into the other. No speakers involved.
        │  move it                  creeeeak     slow: deep and loud
        │                                        fast: high and thin
    50° ┤  close it past here       "wait"
-   32° ┤  ...and here              "no no no"
+   33° ┤  ...and here              "no no no"
    16° ┤  ...and here              "nooo!"
     0° ┴  shut                     (the Mac sleeps)
 
@@ -25,35 +25,59 @@ creakpad plugs one into the other. No speakers involved.
 
 ## Try it
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/Benoitded/creakpad/main/play.sh | sh
-```
+1. Open **Terminal** (press ⌘ Space, type `Terminal`, press Enter).
+2. Paste this line and press Enter:
 
-It downloads one file to `~/.local/bin/creakpad` and starts it in your terminal. The script is
-[play.sh](play.sh), read it first if you like. Then mute your Mac, put it on a table, and move the lid
-slowly.
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/Benoitded/creakpad/main/play.sh | sh
+   ```
+
+3. Mute your Mac, put it on a table, and move the lid slowly.
 
 ```text
   ▕████████████···┊·······················▏  40°  ▼ creeeak
 ```
 
-## Turn it on and off
+It installs one small program, `~/.local/bin/creakpad`, and starts it. Curious what that line does? It
+runs [play.sh](play.sh), 30 lines you can read.
 
-```text
-creakpad              run it in this terminal, Ctrl-C to stop
-creakpad on           keep it running in the background, and start it at every login
-creakpad off          stop it, and stop starting it at login
+## Make it yours
+
+Paste this in Terminal and answer the questions, no code involved:
+
+```sh
+~/.local/bin/creakpad setup
 ```
 
-If `creakpad` isn't found, use its full path: `~/.local/bin/creakpad on`.
-To uninstall: `creakpad off`, then delete `~/.local/bin/creakpad`.
+```text
+Which voice? Try Fred, Daniel or Samantha, or Thomas and Amélie for French.
+  [Fred] › Thomas
+
+What does it say while you close the lid? Separate the lines with commas.
+  [wait, no no no, nooo!] › attends, non non non, nooon !
+
+And when you open it again?
+  [rude.] › malpoli.
+
+Keep it running, even after a restart? (yes or no)
+  [no] › yes
+```
+
+## Turn it on and off
+
+| To | Paste in Terminal |
+| --- | --- |
+| start it once (close the Terminal window to stop it) | `~/.local/bin/creakpad` |
+| keep it running, even after a restart | `~/.local/bin/creakpad on` |
+| stop it for good | `~/.local/bin/creakpad off` |
+| uninstall | `~/.local/bin/creakpad off; rm ~/.local/bin/creakpad` |
 
 ## Needs
 
 - A MacBook with a lid angle sensor: MacBook Pro 16" (2019) and later, and most Apple silicon MacBooks.
 - macOS 12 or later.
 
-Without the sensor, it says so and stops.
+Not sure about yours? Just try it: without the sensor, it says so and stops.
 
 ## How it works
 
@@ -73,16 +97,6 @@ lid sensor ──▶ speed ──▶ creak ──▶ haptic motor ──▶ glas
   [nospeaker](https://github.com/os6/nospeaker).
 
 Everything is one Swift file, [creakpad.swift](creakpad.swift), with no dependencies.
-
-## Make it yours
-
-The lines, the voice and the creak's knobs sit at the top of [creakpad.swift](creakpad.swift):
-
-```swift
-let voice = "Fred"           // any voice from `say -v '?'`
-let begging = [(50, "wait"), (32, "no no no"), (16, "nooo!")]
-let sulk = "rude."
-```
 
 ## Build it yourself
 

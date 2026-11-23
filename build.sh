@@ -40,7 +40,8 @@ echo "built ./creakpad ($(lipo -archs creakpad)). Run it with: ./creakpad"
 [ "$mode" = "release" ] || exit 0
 
 # Release: Developer ID signature (with the hardened runtime Apple requires), then notarization.
-identity=$(security find-identity -v -p codesigning | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' | head -n 1)
+# By its hash: a name with accents (Benoît) comes back garbled from the shell.
+identity=$(security find-identity -v -p codesigning | awk '/Developer ID Application/ { print $2; exit }')
 [ -n "$identity" ] || fail "no Developer ID Application certificate in your keychain. Add one in Xcode:
   Settings > Accounts > your team > Manage Certificates > + > Developer ID Application,
   then run ./build.sh release again."
@@ -53,7 +54,7 @@ xcrun notarytool history --keychain-profile "$profile" >/dev/null 2>&1 || fail "
 
   then run ./build.sh release again."
 
-echo "signing with $identity…"
+echo "signing with the Developer ID $identity…"
 codesign --force --options runtime --timestamp --sign "$identity" creakpad
 codesign --verify --strict creakpad
 

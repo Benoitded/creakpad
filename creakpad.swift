@@ -4,7 +4,8 @@
 // it sulks. No speaker involved: every sound comes from the trackpad's haptic motor, driven through
 // MultitouchSupport (a private macOS framework).
 //
-//   creakpad              run it here, mute your Mac, move the lid. Ctrl-C to stop.
+//   creakpad              start it here, mute your Mac, move the lid. Ctrl-C to stop.
+//   creakpad setup        choose its voice and what it says
 //   creakpad on           run it in the background, now and at every login
 //   creakpad off          stop it, and stop starting at login
 //   creakpad --selftest   check the hinge maths without any hardware
@@ -27,9 +28,7 @@ let creakMinSpeed = 4.0      // °/s below which the hinge stays silent (the sen
 let creakLoudSpeed = 12.0    // °/s at which the creak reaches full strength
 let creakLowHz = 45.0        // creak pitch when the lid moves slowly
 let creakHighHz = 170.0      // creak pitch at 90°/s and faster
-let voice = "Fred"           // any voice from `say -v '?'`
-let begging: [(below: Double, line: String)] = [(50, "wait"), (32, "no no no"), (16, "nooo!")]   // once per closing
-let sulk = "rude."           // when the lid opens again after being shut
+// The voice and the lines are options (--voice, --lines, --sulk): see the Main section.
 
 // MARK: - The hinge
 
@@ -413,10 +412,68 @@ func creak(speed: Double, angle: Double) -> Double {
     return 1 / hz
 }
 
+// MARK: - Settings (asked by `creakpad setup`, kept in ~/Library/Preferences)
+
+let appID = "com.github.benoitded.creakpad"
+let settings = UserDefaults(suiteName: appID)!
+let voice = settings.string(forKey: "voice") ?? "Fred"
+let lines = settings.stringArray(forKey: "lines") ?? ["wait", "no no no", "nooo!"]
+let sulk = settings.string(forKey: "sulk") ?? "rude."
+// The closing lines, spread from 50° down to 16°, each said once per closing.
+let begging = lines.enumerated().map { i, line in
+    (below: lines.count == 1 ? 50 : 50 - 34 * Double(i) / Double(lines.count - 1), line: line)
+}
+
+/// True if macOS has a voice by this name (`say` quietly falls back to the default voice otherwise).
+/// @param name - the voice, like "Fred"
+func voiceExists(_ name: String) -> Bool {
+    let p = Process(), pipe = Pipe()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/say")
+    p.arguments = ["-v", "?"]
+    p.standardOutput = pipe
+    guard (try? p.run()) != nil else { return true }    // can't check: let `say` decide
+    let list = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).lowercased()
+    p.waitUntilExit()
+    return list.split(separator: "\n").contains { $0.hasPrefix(name.lowercased() + " ") }
+}
+
+/// Asks a question in the terminal.
+/// @param question - the question
+/// @param current - the answer kept when they just press Enter
+/// @returns the answer
+func ask(_ question: String, _ current: String) -> String {
+    print("\n\(question)\n  [\(current)] › ", terminator: "")
+    let answer = (readLine() ?? "").trimmingCharacters(in: .whitespaces)
+    return answer.isEmpty ? current : answer
+}
+
+/// Asks for the voice, the lines and whether to start at login, saves them, then exits.
+func setup() -> Never {
+    print("creakpad setup. Press Enter to keep what's in brackets.")
+    var newVoice = ask("Which voice? Try Fred, Daniel or Samantha, or Thomas and Amélie for French.", voice)
+    while !voiceExists(newVoice) {
+        print("  There's no voice called \"\(newVoice)\" on this Mac.")
+        newVoice = ask("Which voice?", voice)
+    }
+    let newLines = ask("What does it say while you close the lid? Separate the lines with commas.", lines.joined(separator: ", "))
+        .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    let newSulk = ask("And when you open it again?", sulk)
+    settings.set(newVoice, forKey: "voice")
+    settings.set(newLines.isEmpty ? lines : newLines, forKey: "lines")
+    settings.set(newSulk, forKey: "sulk")
+    settings.synchronize()
+
+    let isOn = FileManager.default.fileExists(atPath: agentPath)
+    let always = ask("Keep it running, even after a restart? (yes or no)", isOn ? "yes" : "no").lowercased()
+    let on = always.hasPrefix("y") || always.hasPrefix("o")    // yes, oui
+    if on || isOn { switchBackground(on: on) }    // restarts the background copy with the new lines
+    print("\nSaved. Start it with: \(meShort)")
+    exit(0)
+}
+
 // MARK: - On and off (a LaunchAgent, so it also starts at every login)
 
-let agentLabel = "com.github.benoitded.creakpad"
-let agentPath = NSHomeDirectory() + "/Library/LaunchAgents/\(agentLabel).plist"
+let agentPath = NSHomeDirectory() + "/Library/LaunchAgents/\(appID).plist"
 let me = Bundle.main.executablePath ?? CommandLine.arguments[0]
 let meShort = me.replacingOccurrences(of: NSHomeDirectory(), with: "~")
 
@@ -439,21 +496,21 @@ func launchctl(_ args: [String]) -> Bool {
 /// @param on - true to turn it on
 func switchBackground(on: Bool) -> Never {
     let domain = "gui/\(getuid())"
-    launchctl(["bootout", "\(domain)/\(agentLabel)"])    // stop any copy already running
+    launchctl(["bootout", "\(domain)/\(appID)"])    // stop any copy already running
     guard on else {
         try? FileManager.default.removeItem(atPath: agentPath)
-        print("creakpad: off. It won't start at login any more.")
+        print("\ncreakpad: off. It won't start by itself any more.")
         exit(0)
     }
     _ = openLid()    // fail here, in the terminal, rather than silently in the background
-    let agent: [String: Any] = ["Label": agentLabel, "ProgramArguments": [me], "RunAtLoad": true]
+    let agent: [String: Any] = ["Label": appID, "ProgramArguments": [me], "RunAtLoad": true]
     guard let data = try? PropertyListSerialization.data(fromPropertyList: agent, format: .xml, options: 0),
           (try? FileManager.default.createDirectory(atPath: (agentPath as NSString).deletingLastPathComponent, withIntermediateDirectories: true)) != nil,
           FileManager.default.createFile(atPath: agentPath, contents: data),
           launchctl(["bootstrap", domain, agentPath]) else {
         fail("It couldn't set itself up to run in the background (\(agentPath)).")
     }
-    print("creakpad: on. It creaks in the background now and every time you log in.\nTurn it off with: \(meShort) off")
+    print("\ncreakpad: on. It creaks in the background now, and starts by itself every time you log in.\nTo stop it: \(meShort) off")
     exit(0)
 }
 
@@ -490,21 +547,23 @@ func say(_ line: String, _ frames: [Frame], at angle: Double) {
 
 // MARK: - Main
 
+let usage = """
+creakpad: your MacBook's lid creaks through the trackpad.
+
+  creakpad          start it here (Ctrl-C to stop)
+  creakpad setup    choose its voice and what it says
+  creakpad on       keep it running, even after a restart
+  creakpad off      stop it for good
+"""
+
 switch CommandLine.arguments.dropFirst().first {
 case nil: break
+case "setup": setup()
 case "on": switchBackground(on: true)
 case "off": switchBackground(on: false)
 case "--selftest": selfTest()
-default:
-    print("""
-    creakpad: your lid creaks through the trackpad.
-
-      creakpad              run it here. Ctrl-C to stop
-      creakpad on           run it in the background, now and at every login
-      creakpad off          stop it, and stop starting at login
-      creakpad --selftest   check the hinge maths, no hardware needed
-    """)
-    exit(CommandLine.arguments[1] == "--help" ? 0 : 64)
+case "help", "--help", "-h": print(usage); exit(0)
+case let other?: fail("it doesn't know \"\(other)\".\n\n\(usage)")
 }
 
 setvbuf(stdout, nil, _IONBF, 0)
@@ -520,7 +579,10 @@ let beggingFrames = begging.map { render($0.line) }
 let sulkFrames = render(sulk)
 print("""
   creakpad: ready. Mute your Mac, then move the lid slowly.
-            Ctrl-C to stop. \(meShort) on keeps it running in the background.
+
+            stop it                    Ctrl-C
+            choose what it says        \(meShort) setup
+            keep it running always     \(meShort) on
 
 """)
 
