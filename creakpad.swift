@@ -23,7 +23,7 @@ import IOKit.hid
 
 // MARK: - Knobs
 
-let creakMinSpeed = 4.0      // °/s below which the hinge stays silent (the sensor's flicker at rest stays under 3.2)
+let creakMinSpeed = 4.0      // °/s below which the hinge stays silent (the sensor's flicker at rest stays under 2.1)
 let creakLoudSpeed = 12.0    // °/s at which the creak reaches full strength
 let creakLowHz = 45.0        // creak pitch when the lid moves slowly
 let creakHighHz = 170.0      // creak pitch at 90°/s and faster
@@ -32,10 +32,11 @@ let creakHighHz = 170.0      // creak pitch at 90°/s and faster
 // MARK: - The hinge
 
 /// The lid's angle and speed. The sensor reports whole degrees and flickers between two neighbours at rest,
-/// so the speed is the slope of a line fitted to the last 0.4 s of readings: the flicker averages out, and
-/// slow movement still shows.
+/// so the speed is the slope of a line fitted to the last 0.4 s of readings (the flicker averages out), and
+/// it drops to zero as soon as the angle stays within one degree for 0.2 s.
 struct Hinge {
     static let window = 0.4
+    static let still = 0.2
     private var samples: [(t: Double, angle: Double)] = []
     private(set) var angle = 0.0
     private(set) var velocity = 0.0    // °/s, negative while closing
@@ -55,6 +56,10 @@ struct Hinge {
         let cov = samples.reduce(0) { $0 + ($1.t - meanT) * ($1.angle - meanA) }
         let spread = samples.reduce(0) { $0 + ($1.t - meanT) * ($1.t - meanT) }
         velocity = spread > 0 ? cov / spread : 0
+        // Within one degree for the last 0.2 s: that's the flicker, or the end of a move. Stop now rather than
+        // when the slope catches up.
+        let recent = samples.filter { t - $0.t <= Self.still }.map(\.angle)
+        if let lo = recent.min(), let hi = recent.max(), hi - lo <= 1 { velocity = 0 }
     }
 }
 
@@ -222,9 +227,10 @@ let sampleRate = 16000.0
 
 /// Speaks a line with macOS's voice and turns it into motor frames.
 /// @param text - the line
+/// @param voice - the macOS voice
 /// @returns its frames, 10 ms apart
-func render(_ text: String) -> [Frame] {
-    let url = FileManager.default.temporaryDirectory.appendingPathComponent("creakpad-\(getpid()).wav")
+func render(_ text: String, voice: String) -> [Frame] {
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent("creakpad-\(UUID().uuidString).wav")
     defer { try? FileManager.default.removeItem(at: url) }
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/say")
@@ -416,12 +422,38 @@ func creak(speed: Double, angle: Double) -> Double {
 
 let appID = "com.github.benoitded.creakpad"
 let settings = UserDefaults(suiteName: appID)!
-let voice = settings.string(forKey: "voice") ?? "Fred"
-let lines = settings.stringArray(forKey: "lines") ?? ["wait", "no no no", "nooo!"]
-let sulk = settings.string(forKey: "sulk") ?? "rude."
+var voice = settings.string(forKey: "voice") ?? "Fred"
+var lines = settings.stringArray(forKey: "lines") ?? ["wait", "no no no", "nooo!"]
+var sulk = settings.string(forKey: "sulk") ?? "rude."
 // The closing lines, spread from 50° down to 16°, each said once per closing.
-let begging = lines.enumerated().map { i, line in
-    (below: lines.count == 1 ? 50 : 50 - 34 * Double(i) / Double(lines.count - 1), line: line)
+var begging: [(below: Double, line: String)] {
+    lines.enumerated().map { i, line in (below: lines.count == 1 ? 50 : 50 - 34 * Double(i) / Double(lines.count - 1), line: line) }
+}
+
+// The lines as motor frames, by voice and line. Made in the background, so the screen and the creak start
+// at once and a new setting never makes anyone wait.
+let spokenLock = NSLock()
+var spoken: [String: [Frame]] = [:]
+
+/// Prepares the current voice's lines in the background.
+func prepareVoice() {
+    let v = voice, all = lines + [sulk]
+    DispatchQueue.global(qos: .userInitiated).async {
+        for line in all {
+            spokenLock.lock(); let done = spoken["\(v)|\(line)"] != nil; spokenLock.unlock()
+            if done { continue }
+            let frames = render(line, voice: v)
+            spokenLock.lock(); spoken["\(v)|\(line)"] = frames; spokenLock.unlock()
+        }
+    }
+}
+
+/// A line in the current voice, once it's ready.
+/// @param line - the words
+/// @returns its frames, or nil while it's still being prepared
+func framesFor(_ line: String) -> [Frame]? {
+    spokenLock.lock(); defer { spokenLock.unlock() }
+    return spoken["\(voice)|\(line)"]
 }
 
 /// The voices installed on this Mac, lowercased, one `say -v '?'` line each.
@@ -631,8 +663,8 @@ func edit(_ title: String, hint: String, _ current: String) -> String? {
     return nil
 }
 
-/// Asks for the voice and the lines, saves them, then starts over with them.
-func openSettings() -> Never {
+/// Asks for the voice and the lines, and saves them. The main screen is redrawn after.
+func openSettings() {
     let known = [("Fred", "the classic robot"), ("Daniel", "British"), ("Samantha", "American"),
                  ("Thomas", "French"), ("Amélie", "French, from Québec")]
     var voices = known.filter { voiceExists($0.0) }.map { (name: $0.0, note: $0.1) }
@@ -641,21 +673,16 @@ func openSettings() -> Never {
        let closing = edit("What does it say while you close the lid?", hint: "One line per stage, separated by commas.",
                           lines.joined(separator: ", ")),
        let opening = edit("And when you open it again?", hint: "", sulk) {
-        settings.set(voices[v].name, forKey: "voice")
         let newLines = closing.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-        settings.set(newLines.isEmpty ? lines : newLines, forKey: "lines")
-        settings.set(opening, forKey: "sulk")
-        settings.synchronize()
+        voice = voices[v].name
+        lines = newLines.isEmpty ? lines : newLines
+        sulk = opening
+        settings.set(voice, forKey: "voice")
+        settings.set(lines, forKey: "lines")
+        settings.set(sulk, forKey: "sulk")
+        prepareVoice()
     }
-    restart()
-}
-
-/// Starts this program over, so new settings take effect.
-func restart() -> Never {
-    leaveScreen()
-    _ = actuatorClose?(motor)
-    execv(me, [strdup(me), nil])
-    fail("It couldn't restart itself.")
+    drawMain()
 }
 
 // MARK: - Main
@@ -686,19 +713,28 @@ let lid = openLid()
 let motor = openMotor()
 motorPointer = Unmanaged.passUnretained(motor as AnyObject).toOpaque()
 
-enterScreen()
-draw(2, "  \(bold)creakpad\(plain)  \(dim)your lid creaks through the trackpad\(plain)")
-draw(4, "  Warming up its voice…")
-let beggingFrames = begging.map { render($0.line) }
-let sulkFrames = render(sulk)
-draw(4, "  Mute your Mac, put it on a table, then move the lid slowly.")
-draw(8, "  \(dim)It hasn't said anything yet. Close the lid to find out.\(plain)")
-let press = drawButtons(10, [
-    ("q", "quit"), ("s", "settings"),
-    runsInBackground ? ("b", "stop running in the background") : ("b", "keep it running in the background"),
-])
+var press: (Key) -> Character? = { _ in nil }
 
-/// Redraws the gauge row: the lid as a bar, the begging thresholds marked on it.
+/// Draws the main screen: the title, the hint, the buttons. The gauge row fills in as the lid is read.
+func drawMain() {
+    out("\u{1B}[2J")
+    lastStatus = ""
+    draw(2, "  \(bold)creakpad\(plain)  \(dim)your lid creaks through the trackpad\(plain)")
+    draw(4, "  Mute your Mac, put it on a table, then move the lid slowly.")
+    draw(8, "  \(dim)It hasn't said anything yet. Close the lid to find out.\(plain)")
+    press = drawButtons(10, [
+        ("q", "quit"), ("s", "settings"),
+        runsInBackground ? ("b", "stop running in the background") : ("b", "keep it running in the background"),
+    ])
+}
+
+prepareVoice()
+enterScreen()
+drawMain()
+
+var lastStatus = ""
+
+/// Redraws the gauge row when it changed: the lid as a bar, the begging thresholds marked on it.
 /// @param angle - the lid angle
 /// @param state - what is happening, in a few words
 func status(_ angle: Double, _ state: String) {
@@ -706,17 +742,19 @@ func status(_ angle: Double, _ state: String) {
     let filled = Int(min(130, max(0, angle)) / 130 * Double(width))
     let marks = Set(begging.map { Int($0.below / 130 * Double(width)) })
     let bar = (0..<width).map { i in i < filled ? "█" : marks.contains(i) ? "┊" : "·" }.joined()
-    draw(6, "  ▕\(bar)▏ \(String(format: "%3d", Int(angle)))°  \(state)")
+    let row = "  ▕\(bar)▏ \(String(format: "%3d", Int(angle)))°  \(state)"
+    if row != lastStatus { draw(6, row) }
+    lastStatus = row
 }
 
-/// Says a line, and shows it under the gauge.
+/// Says a line, and shows it under the gauge. Right after a start or a new setting, the voice may still be
+/// warming up: the line is then only shown.
 /// @param line - the words
-/// @param frames - the line, from render()
 /// @param angle - the lid angle when it's said
-func say(_ line: String, _ frames: [Frame], at angle: Double) {
+func say(_ line: String, at angle: Double) {
     status(angle, "\(cyan)\"\(line)\"\(plain)")
     draw(8, "  \(dim)It just said\(plain) \"\(line)\"")
-    talk(frames)
+    if let frames = framesFor(line) { talk(frames) }
 }
 
 var hinge = Hinge()
@@ -729,7 +767,7 @@ while !stopRequested {
     if let key = readKey(waiting: 0) {
         switch press(key) ?? (key == .escape ? "q" : nil) {
         case "q": stopRequested = true; continue
-        case "s": openSettings()
+        case "s": openSettings(); said.removeAll(); continue
         case "b":
             let message = setBackground(!runsInBackground)
             leaveScreen()
@@ -747,13 +785,13 @@ while !stopRequested {
 
         if wasShut, angle > 25 {
             wasShut = false
-            say(sulk, sulkFrames, at: angle)
+            say(sulk, at: angle)
             continue
         }
         if hinge.velocity < -creakMinSpeed,
            let i = begging.indices.first(where: { angle < begging[$0].below && !said.contains($0) }) {
             said.formUnion(0...i)    // skip the lines the lid already went past
-            say(begging[i].line, beggingFrames[i], at: angle)
+            say(begging[i].line, at: angle)
             continue
         }
         if t - lastDraw > 0.1 {

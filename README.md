@@ -91,7 +91,8 @@ lid sensor ──▶ speed ──▶ creak ──▶ haptic motor ──▶ glas
 
 - **The lid.** The angle is an ordinary HID sensor (Apple, product 0x8104), read 50 times a second in whole
   degrees. At rest it flickers between two neighbours, so the speed is the slope of a line fitted to the
-  last 0.4 s: the flicker averages out, real movement shows from 4°/s.
+  last 0.4 s, and it drops to zero once the angle stays within a degree for 0.2 s: silent at rest, and the
+  creak starts about 0.1 s after the lid does and stops about 0.15 s after it.
 - **The creak.** A creaky hinge is stick-slip: the wood grips, slips, grips again. The motor pulses 45 to
   170 times a second, faster as the lid moves faster, with random jitter and skipped beats, so no two creaks
   sound the same.
