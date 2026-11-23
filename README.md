@@ -65,7 +65,9 @@ next time.
     4. Thomas      French
     5. Amélie      French, from Québec
 
-  ↑ ↓ or a number, then Enter. Or click one. Esc to cancel.
+  ↑ ↓ or a number, then Enter. Or click one.
+
+  [ ←  back (esc) ]
 ```
 
 ## Keep it running
@@ -89,7 +91,7 @@ lid sensor ──▶ speed ──▶ creak ──▶ haptic motor ──▶ glas
   degrees       °/s       buzz       trackpad        vibrates
 ```
 
-- **The lid.** The angle is an ordinary HID sensor (Apple, product 0x8104), read 50 times a second in whole
+- **The lid.** The angle is an ordinary HID sensor (Apple, product 0x8104), read 100 times a second in whole
   degrees. At rest it flickers between two neighbours, so the speed is the slope of a line fitted to the
   last 0.4 s, and it drops to zero once the angle stays within a degree for 0.2 s: silent at rest, and the
   creak starts about 0.1 s after the lid does and stops about 0.15 s after it.

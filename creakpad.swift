@@ -439,11 +439,12 @@ var spoken: [String: [Frame]] = [:]
 func prepareVoice() {
     let v = voice, all = lines + [sulk]
     DispatchQueue.global(qos: .userInitiated).async {
-        for line in all {
-            spokenLock.lock(); let done = spoken["\(v)|\(line)"] != nil; spokenLock.unlock()
-            if done { continue }
-            let frames = render(line, voice: v)
-            spokenLock.lock(); spoken["\(v)|\(line)"] = frames; spokenLock.unlock()
+        // All lines at once: about 0.9 s instead of 2 s one after another.
+        DispatchQueue.concurrentPerform(iterations: all.count) { i in
+            spokenLock.lock(); let done = spoken["\(v)|\(all[i])"] != nil; spokenLock.unlock()
+            if done { return }
+            let frames = render(all[i], voice: v)
+            spokenLock.lock(); spoken["\(v)|\(all[i])"] = frames; spokenLock.unlock()
         }
     }
 }
@@ -569,7 +570,14 @@ func readKey(waiting ms: Int32) -> Key? {
     case 127, 8: return .backspace
     case 27:
         guard let next = byte() else { return .escape }
-        guard next == UInt8(ascii: "[") else { return nil }
+        if next == UInt8(ascii: "O") {    // some terminals send the arrows as ESC O A
+            switch byte() {
+            case UInt8(ascii: "A")?: return .up
+            case UInt8(ascii: "B")?: return .down
+            default: return nil
+            }
+        }
+        guard next == UInt8(ascii: "[") else { return .escape }    // Esc, with another key right behind it
         var seq: [UInt8] = []    // up to its final byte: "A", or "<0;12;9M" for a click
         while seq.count < 32, let b = byte() { seq.append(b); if (0x40...0x7E).contains(b), b != UInt8(ascii: "<") { break } }
         let code = String(decoding: seq, as: UTF8.self)
@@ -610,29 +618,42 @@ func drawButtons(_ row: Int, _ buttons: [Button]) -> (Key) -> Character? {
     }
 }
 
+/// Clears the screen for one settings question, with a back button that cancels.
+/// @param title - the question
+/// @param hint - how to answer, under the answer
+/// @param hintRow - where the hint goes; the back button sits two rows below
+/// @returns a test for a key or a click that means "back"
+func settingsPage(_ title: String, hint: String, hintRow: Int) -> (Key) -> Bool {
+    out("\u{1B}[2J")
+    draw(2, "  \(bold)creakpad settings\(plain)")
+    draw(4, "  " + title)
+    draw(hintRow, "  \(dim)\(hint)\(plain)")
+    let back = drawButtons(hintRow + 2, [("←", "back (esc)")])
+    return { key in key == .escape || back(key) != nil }
+}
+
 /// Lets them pick one option, with the arrows, its number or a click.
 /// @param title - the question
 /// @param options - the choices, each with a short note
 /// @param current - the one selected at first
-/// @returns the index picked, or nil when they pressed Esc
+/// @returns the index picked, or nil when they went back
 func choose(_ title: String, _ options: [(name: String, note: String)], current: Int) -> Int? {
     var at = current
-    out("\u{1B}[2J")
-    draw(2, "  \(bold)creakpad settings\(plain)")
-    draw(4, "  " + title)
-    draw(7 + options.count, "  \(dim)↑ ↓ or a number, then Enter. Or click one. Esc to cancel.\(plain)")
+    let isBack = settingsPage(title, hint: "↑ ↓ or a number, then Enter. Or click one.", hintRow: 7 + options.count)
     while !stopRequested {
         for (i, o) in options.enumerated() {
             let name = "\(i + 1). \(o.name)".padding(toLength: 14, withPad: " ", startingAt: 0)
             draw(6 + i, i == at ? "  \(cyan)❯ \(name)\(plain) \(dim)\(o.note)\(plain)" : "    \(name) \(dim)\(o.note)\(plain)")
         }
-        switch readKey(waiting: 500) {
-        case .up?: at = (at + options.count - 1) % options.count
-        case .down?: at = (at + 1) % options.count
-        case .enter?: return at
-        case .escape?: return nil
-        case .char(let c)? where c.wholeNumberValue.map { (1...options.count).contains($0) } == true: return c.wholeNumberValue! - 1
-        case .click(let row, _)? where (6..<6 + options.count).contains(row): return row - 6
+        var key: Key?
+        repeat { key = readKey(waiting: 500) } while key == nil && !stopRequested
+        guard let key, !isBack(key) else { return nil }
+        switch key {
+        case .up: at = (at + options.count - 1) % options.count
+        case .down: at = (at + 1) % options.count
+        case .enter: return at
+        case .char(let c) where c.wholeNumberValue.map { (1...options.count).contains($0) } == true: return c.wholeNumberValue! - 1
+        case .click(let row, _) where (6..<6 + options.count).contains(row): return row - 6
         default: break
         }
     }
@@ -643,20 +664,19 @@ func choose(_ title: String, _ options: [(name: String, note: String)], current:
 /// @param title - the question
 /// @param hint - a short help under the field
 /// @param current - the text to start from
-/// @returns the line, or nil when they pressed Esc
+/// @returns the line, or nil when they went back
 func edit(_ title: String, hint: String, _ current: String) -> String? {
     var text = current
-    out("\u{1B}[2J")
-    draw(2, "  \(bold)creakpad settings\(plain)")
-    draw(4, "  " + title)
-    draw(8, "  \(dim)\(hint) Enter to save, Esc to cancel.\(plain)")
+    let isBack = settingsPage(title, hint: hint + " Enter to save.", hintRow: 8)
     while !stopRequested {
         draw(6, "  \(cyan)›\(plain) \(text)\(inverse) \(plain)")
-        switch readKey(waiting: 500) {
-        case .char(let c)?: if text.count < 80 { text.append(c) }
-        case .backspace?: if !text.isEmpty { text.removeLast() }
-        case .enter?: return text.trimmingCharacters(in: .whitespaces).isEmpty ? current : text
-        case .escape?: return nil
+        var key: Key?
+        repeat { key = readKey(waiting: 500) } while key == nil && !stopRequested
+        guard let key, !isBack(key) else { return nil }
+        switch key {
+        case .char(let c): if text.count < 80 { text.append(c) }
+        case .backspace: if !text.isEmpty { text.removeLast() }
+        case .enter: return text.trimmingCharacters(in: .whitespaces).isEmpty ? current : text
         default: break
         }
     }
@@ -776,7 +796,7 @@ while !stopRequested {
         default: break
         }
     }
-    if t - lastRead >= 0.02, let angle = readAngle(lid) {
+    if t - lastRead >= 0.01, let angle = readAngle(lid) {    // 100 reads a second, 0.5 ms each
         if t - lastRead > 3, hinge.angle < 30 { wasShut = true }    // the Mac slept, so the lid was shut
         lastRead = t
         hinge.add(angle, at: t)
