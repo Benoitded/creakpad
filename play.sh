@@ -26,4 +26,5 @@ mkdir -p "$dest"
 mv -f "$tmp/creakpad" "$dest/creakpad"
 echo "installed ~/.local/bin/creakpad"
 
-"$dest/creakpad" "$@"
+# Piped into sh, stdin is the script itself, so give creakpad the keyboard back.
+"$dest/creakpad" "$@" </dev/tty

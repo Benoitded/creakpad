@@ -35,42 +35,45 @@ creakpad plugs one into the other. No speakers involved.
 3. Mute your Mac, put it on a table, and move the lid slowly.
 
 ```text
+  creakpad  your lid creaks through the trackpad
+
+  Mute your Mac, put it on a table, then move the lid slowly.
+
   ▕████████████···┊·······················▏  40°  ▼ creeeak
+
+  It just said "wait"
+
+  [ q  quit ]   [ s  settings ]   [ b  keep it running in the background ]
 ```
 
-It installs one small program, `~/.local/bin/creakpad`, and starts it. Curious what that line does? It
-runs [play.sh](play.sh), 30 lines you can read.
+Click a button or press its key. To open it again later, paste the same line: it also brings you the
+latest version. Curious what the line does? It runs [play.sh](play.sh), 30 lines you can read.
 
 ## Make it yours
 
-Paste this in Terminal and answer the questions, no code involved:
-
-```sh
-~/.local/bin/creakpad setup
-```
+Press **s** or click **settings**: pick a voice, then type what it says. Your choices stay on your Mac for
+next time.
 
 ```text
-Which voice? Try Fred, Daniel or Samantha, or Thomas and Amélie for French.
-  [Fred] › Thomas
+  creakpad settings
 
-What does it say while you close the lid? Separate the lines with commas.
-  [wait, no no no, nooo!] › attends, non non non, nooon !
+  Which voice?
 
-And when you open it again?
-  [rude.] › malpoli.
+  ❯ 1. Fred        the classic robot
+    2. Daniel      British
+    3. Samantha    American
+    4. Thomas      French
+    5. Amélie      French, from Québec
 
-Keep it running, even after a restart? (yes or no)
-  [no] › yes
+  ↑ ↓ or a number, then Enter. Or click one. Esc to cancel.
 ```
 
-## Turn it on and off
+## Keep it running
 
-| To | Paste in Terminal |
-| --- | --- |
-| start it once (close the Terminal window to stop it) | `~/.local/bin/creakpad` |
-| keep it running, even after a restart | `~/.local/bin/creakpad on` |
-| stop it for good | `~/.local/bin/creakpad off` |
-| uninstall | `~/.local/bin/creakpad off; rm ~/.local/bin/creakpad` |
+Press **b** or click **keep it running in the background**: it creaks without the Terminal window, and starts
+by itself every time you log in. To stop that, open it again and press **b**.
+
+To uninstall, paste: `~/.local/bin/creakpad off; rm ~/.local/bin/creakpad`
 
 ## Needs
 
@@ -107,7 +110,7 @@ git clone https://github.com/Benoitded/creakpad
 cd creakpad
 ./build.sh                 # builds ./creakpad for Apple silicon and Intel
 ./creakpad --selftest      # checks the hinge maths, no hardware needed
-./creakpad
+./creakpad                 # q quit · s settings · b background
 ```
 
 ## Caveats

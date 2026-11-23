@@ -4,8 +4,7 @@
 // it sulks. No speaker involved: every sound comes from the trackpad's haptic motor, driven through
 // MultitouchSupport (a private macOS framework).
 //
-//   creakpad              start it here, mute your Mac, move the lid. Ctrl-C to stop.
-//   creakpad setup        choose its voice and what it says
+//   creakpad              start it: a small screen with its settings, mouse and keyboard
 //   creakpad on           run it in the background, now and at every login
 //   creakpad off          stop it, and stop starting at login
 //   creakpad --selftest   check the hinge maths without any hardware
@@ -140,6 +139,7 @@ func waitUntil(_ t: UInt64) {
 /// Stops with a plain explanation.
 /// @param message - what went wrong and what to do
 func fail(_ message: String) -> Never {
+    leaveScreen()
     FileHandle.standardError.write(Data("\n  creakpad: \(message)\n\n".utf8))
     exit(1)
 }
@@ -412,7 +412,7 @@ func creak(speed: Double, angle: Double) -> Double {
     return 1 / hz
 }
 
-// MARK: - Settings (asked by `creakpad setup`, kept in ~/Library/Preferences)
+// MARK: - Settings (kept in ~/Library/Preferences/com.github.benoitded.creakpad.plist)
 
 let appID = "com.github.benoitded.creakpad"
 let settings = UserDefaults(suiteName: appID)!
@@ -424,58 +424,29 @@ let begging = lines.enumerated().map { i, line in
     (below: lines.count == 1 ? 50 : 50 - 34 * Double(i) / Double(lines.count - 1), line: line)
 }
 
-/// True if macOS has a voice by this name (`say` quietly falls back to the default voice otherwise).
-/// @param name - the voice, like "Fred"
-func voiceExists(_ name: String) -> Bool {
+/// The voices installed on this Mac, lowercased, one `say -v '?'` line each.
+let installedVoices: [Substring] = {
     let p = Process(), pipe = Pipe()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/say")
     p.arguments = ["-v", "?"]
     p.standardOutput = pipe
-    guard (try? p.run()) != nil else { return true }    // can't check: let `say` decide
+    guard (try? p.run()) != nil else { return [] }
     let list = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self).lowercased()
     p.waitUntilExit()
-    return list.split(separator: "\n").contains { $0.hasPrefix(name.lowercased() + " ") }
+    return list.split(separator: "\n")
+}()
+
+/// True if macOS has a voice by this name (`say` quietly falls back to the default voice otherwise).
+/// @param name - the voice, like "Fred"
+func voiceExists(_ name: String) -> Bool {
+    installedVoices.contains { $0.hasPrefix(name.lowercased() + " ") }
 }
 
-/// Asks a question in the terminal.
-/// @param question - the question
-/// @param current - the answer kept when they just press Enter
-/// @returns the answer
-func ask(_ question: String, _ current: String) -> String {
-    print("\n\(question)\n  [\(current)] › ", terminator: "")
-    let answer = (readLine() ?? "").trimmingCharacters(in: .whitespaces)
-    return answer.isEmpty ? current : answer
-}
-
-/// Asks for the voice, the lines and whether to start at login, saves them, then exits.
-func setup() -> Never {
-    print("creakpad setup. Press Enter to keep what's in brackets.")
-    var newVoice = ask("Which voice? Try Fred, Daniel or Samantha, or Thomas and Amélie for French.", voice)
-    while !voiceExists(newVoice) {
-        print("  There's no voice called \"\(newVoice)\" on this Mac.")
-        newVoice = ask("Which voice?", voice)
-    }
-    let newLines = ask("What does it say while you close the lid? Separate the lines with commas.", lines.joined(separator: ", "))
-        .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-    let newSulk = ask("And when you open it again?", sulk)
-    settings.set(newVoice, forKey: "voice")
-    settings.set(newLines.isEmpty ? lines : newLines, forKey: "lines")
-    settings.set(newSulk, forKey: "sulk")
-    settings.synchronize()
-
-    let isOn = FileManager.default.fileExists(atPath: agentPath)
-    let always = ask("Keep it running, even after a restart? (yes or no)", isOn ? "yes" : "no").lowercased()
-    let on = always.hasPrefix("y") || always.hasPrefix("o")    // yes, oui
-    if on || isOn { switchBackground(on: on) }    // restarts the background copy with the new lines
-    print("\nSaved. Start it with: \(meShort)")
-    exit(0)
-}
-
-// MARK: - On and off (a LaunchAgent, so it also starts at every login)
+// MARK: - Running in the background (a LaunchAgent, so it also starts at every login)
 
 let agentPath = NSHomeDirectory() + "/Library/LaunchAgents/\(appID).plist"
 let me = Bundle.main.executablePath ?? CommandLine.arguments[0]
-let meShort = me.replacingOccurrences(of: NSHomeDirectory(), with: "~")
+var runsInBackground: Bool { FileManager.default.fileExists(atPath: agentPath) }
 
 /// Runs launchctl quietly.
 /// @param args - its arguments
@@ -492,17 +463,16 @@ func launchctl(_ args: [String]) -> Bool {
     return p.terminationStatus == 0
 }
 
-/// Turns the background creak on (now and at every login) or off, then exits.
-/// @param on - true to turn it on
-func switchBackground(on: Bool) -> Never {
+/// Starts or stops the background copy, which also starts by itself at every login.
+/// @param on - true to start it
+/// @returns a sentence saying what happened
+func setBackground(_ on: Bool) -> String {
     let domain = "gui/\(getuid())"
     launchctl(["bootout", "\(domain)/\(appID)"])    // stop any copy already running
     guard on else {
         try? FileManager.default.removeItem(atPath: agentPath)
-        print("\ncreakpad: off. It won't start by itself any more.")
-        exit(0)
+        return "creakpad: off. It won't start by itself any more."
     }
-    _ = openLid()    // fail here, in the terminal, rather than silently in the background
     let agent: [String: Any] = ["Label": appID, "ProgramArguments": [me], "RunAtLoad": true]
     guard let data = try? PropertyListSerialization.data(fromPropertyList: agent, format: .xml, options: 0),
           (try? FileManager.default.createDirectory(atPath: (agentPath as NSString).deletingLastPathComponent, withIntermediateDirectories: true)) != nil,
@@ -510,57 +480,198 @@ func switchBackground(on: Bool) -> Never {
           launchctl(["bootstrap", domain, agentPath]) else {
         fail("It couldn't set itself up to run in the background (\(agentPath)).")
     }
-    print("\ncreakpad: on. It creaks in the background now, and starts by itself every time you log in.\nTo stop it: \(meShort) off")
-    exit(0)
+    return "creakpad: on. It creaks in the background, and starts by itself every time you log in.\nTo stop it, open creakpad again and press b."
 }
 
-// MARK: - The terminal
+// MARK: - The screen: keys one by one, mouse clicks, drawn in the terminal's alternate screen
 
-let gaugeWidth = 39    // one character per 130/39 ≈ 3.3°, wide open at the right
+let interactive = isatty(STDIN_FILENO) == 1 && isatty(STDOUT_FILENO) == 1
+var savedTermios = termios()
+var screenOn = false
+let bold = "\u{1B}[1m", dim = "\u{1B}[2m", cyan = "\u{1B}[36m", inverse = "\u{1B}[7m", plain = "\u{1B}[0m"
 
-/// The lid as a bar, with the begging thresholds marked on it.
-/// @param angle - the lid angle
-/// @returns e.g. `▕██████████████████:::·····▏`
-func gauge(_ angle: Double) -> String {
-    let filled = Int(min(130, max(0, angle)) / 130 * Double(gaugeWidth))
-    let marks = Set(begging.map { Int($0.below / 130 * Double(gaugeWidth)) })
-    let cells = (0..<gaugeWidth).map { i in i < filled ? "█" : marks.contains(i) ? "┊" : "·" }
-    return "▕" + cells.joined() + "▏"
+/// Writes to the terminal at once.
+func out(_ s: String) { FileHandle.standardOutput.write(Data(s.utf8)) }
+
+/// Takes over the terminal: no echo, keys one by one, clicks reported, cursor hidden.
+func enterScreen() {
+    guard interactive, !screenOn else { return }
+    screenOn = true
+    tcgetattr(STDIN_FILENO, &savedTermios)
+    var t = savedTermios
+    t.c_lflag &= ~tcflag_t(ICANON | ECHO)
+    tcsetattr(STDIN_FILENO, TCSANOW, &t)
+    out("\u{1B}[?1049h\u{1B}[?25l\u{1B}[?1000h\u{1B}[?1006h\u{1B}[2J")
 }
 
-/// Redraws the live line.
-/// @param angle - the lid angle
-/// @param state - what is happening, in a few words
-func status(_ angle: Double, _ state: String) {
-    print("\r  \(gauge(angle)) \(String(format: "%3d", Int(angle)))°  \(state.padding(toLength: 20, withPad: " ", startingAt: 0))", terminator: "")
+/// Gives the terminal back as it was.
+func leaveScreen() {
+    guard screenOn else { return }
+    screenOn = false
+    out("\u{1B}[?1006l\u{1B}[?1000l\u{1B}[?25h\u{1B}[?1049l")
+    tcsetattr(STDIN_FILENO, TCSANOW, &savedTermios)
 }
 
-/// Says a line, and keeps it in the terminal above the live line.
-/// @param line - the words
-/// @param frames - the line, from render()
-/// @param angle - the lid angle when it's said
-func say(_ line: String, _ frames: [Frame], at angle: Double) {
-    status(angle, "\"\(line)\"")
-    print("")
-    talk(frames)
+/// Replaces one row of the screen.
+/// @param row - 1 is the top
+/// @param text - what to show
+func draw(_ row: Int, _ text: String) {
+    if screenOn { out("\u{1B}[\(row);1H\u{1B}[2K\(text)") }
+}
+
+enum Key: Equatable { case char(Character), up, down, enter, backspace, escape, click(row: Int, col: Int) }
+
+/// Reads one key or click.
+/// @param ms - how long to wait for one, in milliseconds
+/// @returns it, or nil when nothing (or nothing it understands) came
+func readKey(waiting ms: Int32) -> Key? {
+    func byte(_ wait: Int32 = 30) -> UInt8? {
+        var fds = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
+        var b: UInt8 = 0
+        guard poll(&fds, 1, wait) > 0, read(STDIN_FILENO, &b, 1) == 1 else { return nil }
+        return b
+    }
+    guard screenOn, let c = byte(ms) else { return nil }
+    switch c {
+    case 13, 10: return .enter
+    case 127, 8: return .backspace
+    case 27:
+        guard let next = byte() else { return .escape }
+        guard next == UInt8(ascii: "[") else { return nil }
+        var seq: [UInt8] = []    // up to its final byte: "A", or "<0;12;9M" for a click
+        while seq.count < 32, let b = byte() { seq.append(b); if (0x40...0x7E).contains(b), b != UInt8(ascii: "<") { break } }
+        let code = String(decoding: seq, as: UTF8.self)
+        if code == "A" { return .up }
+        if code == "B" { return .down }
+        let n = code.dropFirst().dropLast().split(separator: ";").compactMap { Int($0) }
+        if code.hasPrefix("<"), code.hasSuffix("M"), n.count == 3, n[0] == 0 { return .click(row: n[2], col: n[1]) }
+        return nil
+    default:
+        var bytes = [c]    // a character like é takes several bytes
+        for _ in 0..<(c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : c >= 0xC0 ? 1 : 0) { if let b = byte() { bytes.append(b) } }
+        guard c >= 32, let ch = String(decoding: bytes, as: UTF8.self).first else { return nil }
+        return .char(ch)
+    }
+}
+
+typealias Button = (key: Character, label: String)
+
+/// Draws buttons on a row, and says which one a key or a click pressed.
+/// @param row - the row
+/// @param buttons - each button's key and label
+/// @returns a function from a key or click to the key of the button it pressed, if any
+func drawButtons(_ row: Int, _ buttons: [Button]) -> (Key) -> Character? {
+    var line = "  ", col = 3, hits: [(Character, ClosedRange<Int>)] = []
+    for b in buttons {
+        let text = " \(b.key)  \(b.label) "
+        hits.append((b.key, col...(col + text.count - 1)))
+        line += inverse + text + plain + "   "
+        col += text.count + 3
+    }
+    draw(row, line)
+    return { key in
+        switch key {
+        case .char(let c): return buttons.first { $0.key == Character(c.lowercased()) }?.key
+        case .click(let r, let c) where r == row: return hits.first { $0.1.contains(c) }?.0
+        default: return nil
+        }
+    }
+}
+
+/// Lets them pick one option, with the arrows, its number or a click.
+/// @param title - the question
+/// @param options - the choices, each with a short note
+/// @param current - the one selected at first
+/// @returns the index picked, or nil when they pressed Esc
+func choose(_ title: String, _ options: [(name: String, note: String)], current: Int) -> Int? {
+    var at = current
+    out("\u{1B}[2J")
+    draw(2, "  \(bold)creakpad settings\(plain)")
+    draw(4, "  " + title)
+    draw(7 + options.count, "  \(dim)↑ ↓ or a number, then Enter. Or click one. Esc to cancel.\(plain)")
+    while !stopRequested {
+        for (i, o) in options.enumerated() {
+            let name = "\(i + 1). \(o.name)".padding(toLength: 14, withPad: " ", startingAt: 0)
+            draw(6 + i, i == at ? "  \(cyan)❯ \(name)\(plain) \(dim)\(o.note)\(plain)" : "    \(name) \(dim)\(o.note)\(plain)")
+        }
+        switch readKey(waiting: 500) {
+        case .up?: at = (at + options.count - 1) % options.count
+        case .down?: at = (at + 1) % options.count
+        case .enter?: return at
+        case .escape?: return nil
+        case .char(let c)? where c.wholeNumberValue.map { (1...options.count).contains($0) } == true: return c.wholeNumberValue! - 1
+        case .click(let row, _)? where (6..<6 + options.count).contains(row): return row - 6
+        default: break
+        }
+    }
+    return nil
+}
+
+/// Lets them type a line, starting from what's there now.
+/// @param title - the question
+/// @param hint - a short help under the field
+/// @param current - the text to start from
+/// @returns the line, or nil when they pressed Esc
+func edit(_ title: String, hint: String, _ current: String) -> String? {
+    var text = current
+    out("\u{1B}[2J")
+    draw(2, "  \(bold)creakpad settings\(plain)")
+    draw(4, "  " + title)
+    draw(8, "  \(dim)\(hint) Enter to save, Esc to cancel.\(plain)")
+    while !stopRequested {
+        draw(6, "  \(cyan)›\(plain) \(text)\(inverse) \(plain)")
+        switch readKey(waiting: 500) {
+        case .char(let c)?: if text.count < 80 { text.append(c) }
+        case .backspace?: if !text.isEmpty { text.removeLast() }
+        case .enter?: return text.trimmingCharacters(in: .whitespaces).isEmpty ? current : text
+        case .escape?: return nil
+        default: break
+        }
+    }
+    return nil
+}
+
+/// Asks for the voice and the lines, saves them, then starts over with them.
+func openSettings() -> Never {
+    let known = [("Fred", "the classic robot"), ("Daniel", "British"), ("Samantha", "American"),
+                 ("Thomas", "French"), ("Amélie", "French, from Québec")]
+    var voices = known.filter { voiceExists($0.0) }.map { (name: $0.0, note: $0.1) }
+    if !voices.contains(where: { $0.name == voice }) { voices.insert((voice, "yours"), at: 0) }
+    if let v = choose("Which voice?", voices, current: voices.firstIndex { $0.name == voice } ?? 0),
+       let closing = edit("What does it say while you close the lid?", hint: "One line per stage, separated by commas.",
+                          lines.joined(separator: ", ")),
+       let opening = edit("And when you open it again?", hint: "", sulk) {
+        settings.set(voices[v].name, forKey: "voice")
+        let newLines = closing.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        settings.set(newLines.isEmpty ? lines : newLines, forKey: "lines")
+        settings.set(opening, forKey: "sulk")
+        settings.synchronize()
+    }
+    restart()
+}
+
+/// Starts this program over, so new settings take effect.
+func restart() -> Never {
+    leaveScreen()
+    _ = actuatorClose?(motor)
+    execv(me, [strdup(me), nil])
+    fail("It couldn't restart itself.")
 }
 
 // MARK: - Main
 
 let usage = """
-creakpad: your MacBook's lid creaks through the trackpad.
+creakpad: your MacBook's lid creaks through the trackpad. Run it without anything to start.
 
-  creakpad          start it here (Ctrl-C to stop)
-  creakpad setup    choose its voice and what it says
-  creakpad on       keep it running, even after a restart
-  creakpad off      stop it for good
+  creakpad on           keep it running in the background, and start it at every login
+  creakpad off          stop the background copy
+  creakpad --selftest   check the hinge maths, no hardware needed
 """
 
 switch CommandLine.arguments.dropFirst().first {
 case nil: break
-case "setup": setup()
-case "on": switchBackground(on: true)
-case "off": switchBackground(on: false)
+case "on": print(setBackground(true)); exit(0)
+case "off": print(setBackground(false)); exit(0)
 case "--selftest": selfTest()
 case "help", "--help", "-h": print(usage); exit(0)
 case let other?: fail("it doesn't know \"\(other)\".\n\n\(usage)")
@@ -569,30 +680,64 @@ case let other?: fail("it doesn't know \"\(other)\".\n\n\(usage)")
 setvbuf(stdout, nil, _IONBF, 0)
 signal(SIGINT) { _ in stopRequested = true }
 signal(SIGTERM) { _ in stopRequested = true }    // `creakpad off` stops the background copy this way
+signal(SIGHUP) { _ in stopRequested = true }     // the Terminal window was closed
 
 let lid = openLid()
 let motor = openMotor()
 motorPointer = Unmanaged.passUnretained(motor as AnyObject).toOpaque()
 
-print("\n  creakpad: warming up its voice…")
+enterScreen()
+draw(2, "  \(bold)creakpad\(plain)  \(dim)your lid creaks through the trackpad\(plain)")
+draw(4, "  Warming up its voice…")
 let beggingFrames = begging.map { render($0.line) }
 let sulkFrames = render(sulk)
-print("""
-  creakpad: ready. Mute your Mac, then move the lid slowly.
+draw(4, "  Mute your Mac, put it on a table, then move the lid slowly.")
+draw(8, "  \(dim)It hasn't said anything yet. Close the lid to find out.\(plain)")
+let press = drawButtons(10, [
+    ("q", "quit"), ("s", "settings"),
+    runsInBackground ? ("b", "stop running in the background") : ("b", "keep it running in the background"),
+])
 
-            stop it                    Ctrl-C
-            choose what it says        \(meShort) setup
-            keep it running always     \(meShort) on
+/// Redraws the gauge row: the lid as a bar, the begging thresholds marked on it.
+/// @param angle - the lid angle
+/// @param state - what is happening, in a few words
+func status(_ angle: Double, _ state: String) {
+    let width = 39    // one cell per 130/39 ≈ 3.3°
+    let filled = Int(min(130, max(0, angle)) / 130 * Double(width))
+    let marks = Set(begging.map { Int($0.below / 130 * Double(width)) })
+    let bar = (0..<width).map { i in i < filled ? "█" : marks.contains(i) ? "┊" : "·" }.joined()
+    draw(6, "  ▕\(bar)▏ \(String(format: "%3d", Int(angle)))°  \(state)")
+}
 
-""")
+/// Says a line, and shows it under the gauge.
+/// @param line - the words
+/// @param frames - the line, from render()
+/// @param angle - the lid angle when it's said
+func say(_ line: String, _ frames: [Frame], at angle: Double) {
+    status(angle, "\(cyan)\"\(line)\"\(plain)")
+    draw(8, "  \(dim)It just said\(plain) \"\(line)\"")
+    talk(frames)
+}
 
 var hinge = Hinge()
-var lastRead = now(), lastPrint = 0.0
+var lastRead = now(), lastDraw = 0.0
 var said = Set<Int>()       // begging lines already said during this closing
 var wasShut = false
 
 while !stopRequested {
     let t = now()
+    if let key = readKey(waiting: 0) {
+        switch press(key) ?? (key == .escape ? "q" : nil) {
+        case "q": stopRequested = true; continue
+        case "s": openSettings()
+        case "b":
+            let message = setBackground(!runsInBackground)
+            leaveScreen()
+            print(message)
+            exit(0)    // the background copy, if any, takes over from here
+        default: break
+        }
+    }
     if t - lastRead >= 0.02, let angle = readAngle(lid) {
         if t - lastRead > 3, hinge.angle < 30 { wasShut = true }    // the Mac slept, so the lid was shut
         lastRead = t
@@ -611,8 +756,8 @@ while !stopRequested {
             say(begging[i].line, beggingFrames[i], at: angle)
             continue
         }
-        if t - lastPrint > 0.1 {
-            lastPrint = t
+        if t - lastDraw > 0.1 {
+            lastDraw = t
             status(angle, abs(hinge.velocity) < creakMinSpeed ? "quiet" : hinge.velocity < 0 ? "▼ creeeak" : "▲ creeeak")
         }
     }
@@ -621,5 +766,5 @@ while !stopRequested {
     waitUntil(mach_absolute_time() + UInt64(creak(speed: speed, angle: hinge.angle) * ticksPerSecond))
 }
 
-print("\n")
+leaveScreen()
 _ = actuatorClose?(motor)
