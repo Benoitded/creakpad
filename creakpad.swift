@@ -16,6 +16,7 @@
 // driven past its normal maximum.
 
 import AVFoundation
+import CoreAudio
 import Darwin
 import Foundation
 import IOKit
@@ -27,7 +28,6 @@ let creakMinSpeed = 4.0      // °/s below which the hinge stays silent (the sen
 let creakLoudSpeed = 12.0    // °/s at which the creak reaches full strength
 let creakLowHz = 45.0        // creak pitch when the lid moves slowly
 let creakHighHz = 170.0      // creak pitch at 90°/s and faster
-// The voice and the lines are options (--voice, --lines, --sulk): see the Main section.
 
 // MARK: - The hinge
 
@@ -83,6 +83,7 @@ func selfTest() -> Never {
             fail("selftest: \(speed)°/s reads as \(settled.min() ?? 0) to \(settled.max() ?? 0)°/s")
         }
     }
+    guard variants("a| b ||c") == ["a", "b", "c"], variants("solo") == ["solo"] else { fail("selftest: variants") }
     print("selftest: ok (rest peaks at \(String(format: "%.1f", rest))°/s)")
     exit(0)
 }
@@ -197,19 +198,23 @@ func openMotor() -> CFTypeRef {
 
 var motorPointer: UnsafeMutableRawPointer?
 
+var motorPeak: Float = 0    // the strongest buzz since the screen last looked
+
 /// Plays tones together on the motor.
 /// @param tones - frequencies in Hz with their relative strength (scaled to add up to 1)
 /// @param ms - how long, in milliseconds
 /// @param level - overall strength, 0 to 1
 func play(_ tones: [(hz: Double, amp: Double)], ms: Double, level: Float) {
     guard let motorPointer, !tones.isEmpty else { return }
+    let level = min(1, max(0, level)) * intensity
+    motorPeak = max(motorPeak, level)
     let sum = max(tones.reduce(0) { $0 + $1.amp }, 0.0001)
     let shape: [String: Any] = [
         "BaseWaveform": ["Type": "Gaussian", "Amplitude": 0.0, "DurationMS": ms],
         "Tones": tones.map { ["Type": "Sine", "Amplitude": $0.amp / sum, "DurationMS": ms, "DelayMS": 0.0, "FrequencykHz": $0.hz / 1000] },
     ]
     guard let act = actuationCreate!(shape as CFDictionary, 0) else { return }
-    _ = actuationPlay!(act, motorPointer, 0, min(1, max(0, level)), 0)
+    _ = actuationPlay!(act, motorPointer, 0, level, 0)
     Unmanaged<AnyObject>.fromOpaque(act).release()
 }
 
@@ -234,13 +239,13 @@ func render(_ text: String, voice: String) -> [Frame] {
     defer { try? FileManager.default.removeItem(at: url) }
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/say")
-    p.arguments = ["-o", url.path, "--file-format=WAVE", "--data-format=LEF32@16000", "-v", voice, text]
+    p.arguments = ["-o", url.path, "--file-format=WAVE", "--data-format=LEF32@16000", "-v", voice, "--", text]    // "--": a line starting with "-" is not an option
     do { try p.run() } catch { fail("It couldn't run macOS's voice (/usr/bin/say).") }
     p.waitUntilExit()
     guard p.terminationStatus == 0, let file = try? AVAudioFile(forReading: url),
           let buf = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)),
           (try? file.read(into: buf)) != nil, let ch = buf.floatChannelData?[0] else {
-        fail("macOS's voice (say) couldn't speak \"\(text)\".")
+        return []    // a line it can't speak stays silent: it must not stop everything (this runs in the background)
     }
     var f = analyse(Array(UnsafeBufferPointer(start: ch, count: Int(buf.frameLength))))
     while let first = f.first, first.level == 0 { f.removeFirst() }
@@ -423,11 +428,38 @@ func creak(speed: Double, angle: Double) -> Double {
 let appID = "com.github.benoitded.creakpad"
 let settings = UserDefaults(suiteName: appID)!
 var voice = settings.string(forKey: "voice") ?? "Fred"
-var lines = settings.stringArray(forKey: "lines") ?? ["wait", "no no no", "nooo!"]
-var sulk = settings.string(forKey: "sulk") ?? "rude."
-// The closing lines, spread from 50° down to 16°, each said once per closing.
+// A stage (or the sulk) may hold several lines separated by "|": one is picked each time it comes up.
+var lines = settings.stringArray(forKey: "lines") ?? [
+    "wait|hold on|hey|careful now|easy there|slow down|um|excuse me",
+    "no no no|please no|stop it|not so fast|I'm warning you|don't do it|ow ow ow|my hinges!",
+    "nooo!|don't you dare|I'm begging you|mercy!|have a heart|I have a family|not the dark!|help!",
+]
+var sulk = settings.string(forKey: "sulk") ?? "rude.|how dare you|oh, you're back|ugh, fine|finally|hello again|well, well, well|miss me?|hi, I guess|that was dark|never do that again|welcome back, I suppose"
+
+// Said once when the lid is wide open.
+var wideOpen = settings.string(forKey: "wide") ?? "ahh, much better|wide open!|finally, some air|oh, the view|that's the stuff|so bright|hello world|stretch!"
+// The angles, in degrees: the first closing line comes below `beggingFrom`, the last below `beggingTo`.
+var beggingFrom = settings.object(forKey: "from") as? Double ?? 50
+var beggingTo = settings.object(forKey: "to") as? Double ?? 16
+var wideAngle = settings.object(forKey: "wideAngle") as? Double ?? 120
+// How hard the motor buzzes, from 0.25 to 1. Never above 1: that's the motor's normal maximum.
+var intensity = Float(min(1, max(0.25, settings.object(forKey: "intensity") as? Double ?? 1)))
+
+/// A line of a stage, chosen among those already prepared (any of them if none is yet).
+func pick(_ stage: String) -> String {
+    let all = variants(stage)
+    return all.filter { framesFor($0) != nil }.randomElement() ?? all.randomElement()!
+}
+
+/// The lines a stage can say.
+func variants(_ stage: String) -> [String] {
+    let all = stage.split(separator: "|").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    return all.isEmpty ? [stage] : all
+}
+
+// The closing lines, spread from `beggingFrom` down to `beggingTo`, each said once per closing.
 var begging: [(below: Double, line: String)] {
-    lines.enumerated().map { i, line in (below: lines.count == 1 ? 50 : 50 - 34 * Double(i) / Double(lines.count - 1), line: line) }
+    lines.enumerated().map { i, line in (below: lines.count == 1 ? beggingFrom : beggingFrom - (beggingFrom - beggingTo) * Double(i) / Double(lines.count - 1), line: line) }
 }
 
 // The lines as motor frames, by voice and line. Made in the background, so the screen and the creak start
@@ -437,7 +469,10 @@ var spoken: [String: [Frame]] = [:]
 
 /// Prepares the current voice's lines in the background.
 func prepareVoice() {
-    let v = voice, all = lines + [sulk]
+    let v = voice
+    // One line per stage first, so the creak can speak at once; the other variants follow.
+    let stages = (lines + [sulk, wideOpen]).map(variants)
+    let all = stages.map { $0[0] } + stages.flatMap { $0.dropFirst() }
     DispatchQueue.global(qos: .userInitiated).async {
         // All lines at once: about 0.9 s instead of 2 s one after another.
         DispatchQueue.concurrentPerform(iterations: all.count) { i in
@@ -669,12 +704,12 @@ func edit(_ title: String, hint: String, _ current: String) -> String? {
     var text = current
     let isBack = settingsPage(title, hint: hint + " Enter to save.", hintRow: 8)
     while !stopRequested {
-        draw(6, "  \(cyan)›\(plain) \(text)\(inverse) \(plain)")
+        draw(6, "  \(cyan)›\(plain) \(text.suffix(max(10, columns() - 6)))\(inverse) \(plain)")    // the end only: a wrapped line would push the rows below
         var key: Key?
         repeat { key = readKey(waiting: 500) } while key == nil && !stopRequested
         guard let key, !isBack(key) else { return nil }
         switch key {
-        case .char(let c): if text.count < 80 { text.append(c) }
+        case .char(let c): if text.count < 500 { text.append(c) }
         case .backspace: if !text.isEmpty { text.removeLast() }
         case .enter: return text.trimmingCharacters(in: .whitespaces).isEmpty ? current : text
         default: break
@@ -683,26 +718,174 @@ func edit(_ title: String, hint: String, _ current: String) -> String? {
     return nil
 }
 
-/// Asks for the voice and the lines, and saves them. The main screen is redrawn after.
-func openSettings() {
+/// Says something short and waits for OK (or back).
+func notice(_ message: String) { _ = choose(message, [(name: "OK", note: "")], current: 0) }
+
+/// Asks for a number of degrees.
+/// @returns it, or nil when they went back or typed something else (they're told)
+func askAngle(_ title: String, _ current: Double) -> Double? {
+    guard let text = edit(title, hint: "Degrees, from 5 to 130.", String(Int(current))) else { return nil }
+    guard let n = Double(text.trimmingCharacters(in: .whitespaces)), (5...130).contains(n) else {
+        notice("That isn't a number of degrees from 5 to 130.")
+        return nil
+    }
+    return n
+}
+
+func settingsVoice() {
     let known = [("Fred", "the classic robot"), ("Daniel", "British"), ("Samantha", "American"),
                  ("Thomas", "French"), ("Amélie", "French, from Québec")]
     var voices = known.filter { voiceExists($0.0) }.map { (name: $0.0, note: $0.1) }
     if !voices.contains(where: { $0.name == voice }) { voices.insert((voice, "yours"), at: 0) }
-    if let v = choose("Which voice?", voices, current: voices.firstIndex { $0.name == voice } ?? 0),
-       let closing = edit("What does it say while you close the lid?", hint: "One line per stage, separated by commas.",
-                          lines.joined(separator: ", ")),
-       let opening = edit("And when you open it again?", hint: "", sulk) {
-        let newLines = closing.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-        voice = voices[v].name
-        lines = newLines.isEmpty ? lines : newLines
-        sulk = opening
-        settings.set(voice, forKey: "voice")
-        settings.set(lines, forKey: "lines")
-        settings.set(sulk, forKey: "sulk")
-        prepareVoice()
+    guard let v = choose("Which voice?", voices, current: voices.firstIndex { $0.name == voice } ?? 0) else { return }
+    voice = voices[v].name
+    settings.set(voice, forKey: "voice")
+    prepareVoice()
+}
+
+func settingsLines() {
+    let texts = [("While you close the lid", lines.joined(separator: ", ")),
+                 ("When you open it again", sulk), ("When it's wide open", wideOpen)]
+    guard let w = choose("What do you want to change?", texts.map { (name: $0.0, note: String($0.1.prefix(40))) }, current: 0) else { return }
+    let hint = w == 0 ? "One stage per comma. Several lines for a stage? Separate them with |"
+                      : "Separate the lines it picks from with |"
+    guard let text = edit(texts[w].0 + "?", hint: hint, texts[w].1) else { return }
+    switch w {
+    case 0:
+        let stages = text.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        if !stages.isEmpty { lines = stages; settings.set(lines, forKey: "lines") }
+    case 1: sulk = text; settings.set(sulk, forKey: "sulk")
+    default: wideOpen = text; settings.set(wideOpen, forKey: "wide")
+    }
+    prepareVoice()
+}
+
+func settingsIntensity() {
+    let levels: [Float] = [0.25, 0.5, 0.75, 1]
+    guard let i = choose("How hard should it buzz?", levels.map { (name: "\(Int($0 * 100))%", note: $0 == 1 ? "the full creak" : "") },
+                         current: levels.firstIndex { $0 >= intensity } ?? 3) else { return }
+    intensity = levels[i]
+    settings.set(Double(intensity), forKey: "intensity")
+    play([(200, 1)], ms: 80, level: 1)    // a taste of it
+}
+
+func settingsAngles() {
+    let angles = [("It starts begging below", "\(Int(beggingFrom))°"), ("The last line comes below", "\(Int(beggingTo))°"),
+                  ("It says something above", "\(Int(wideAngle))°")]
+    guard let w = choose("Which angle?", angles.map { (name: $0.0, note: $0.1) }, current: 0),
+          let n = askAngle(angles[w].0 + "?", [beggingFrom, beggingTo, wideAngle][w]) else { return }
+    switch w {
+    case 0 where n <= beggingTo: notice("It must be above the last line's angle (\(Int(beggingTo))°).")
+    case 0: beggingFrom = n; settings.set(n, forKey: "from")
+    case 1 where n >= beggingFrom: notice("It must be below the first line's angle (\(Int(beggingFrom))°).")
+    case 1: beggingTo = n; settings.set(n, forKey: "to")
+    default: wideAngle = n; settings.set(n, forKey: "wideAngle")
+    }
+    said.removeAll()
+}
+
+/// The settings menu: pick what to change, change it, and it's saved at once. Back leaves.
+func openSettings() {
+    var at = 0
+    while !stopRequested {
+        let menu = [("Voice", "the accent: \(voice)"),
+                    ("What it says", "closing, reopening, wide open"),
+                    ("Intensity", "how hard it buzzes: \(Int(intensity * 100))%"),
+                    ("Angles", "begging \(Int(beggingFrom))° to \(Int(beggingTo))°, wide open \(Int(wideAngle))°")]
+        guard let item = choose("Settings", menu.map { (name: $0.0, note: $0.1) }, current: at) else { break }
+        at = item
+        [settingsVoice, settingsLines, settingsIntensity, settingsAngles][item]()
     }
     drawMain()
+}
+
+var press: (Key) -> Character? = { _ in nil }
+
+/// The Mac's speaker state, read from CoreAudio (no sound is played to find out).
+/// @returns whether it's muted, and its volume from 0 to 1; nil if there's no output device
+func macSound() -> (muted: Bool, volume: Double)? {
+    func address(_ selector: UInt32, _ element: UInt32 = 0) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeOutput, mElement: element)
+    }
+    var device = AudioObjectID(0), size = UInt32(MemoryLayout<AudioObjectID>.size)
+    var defaultOut = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal, mElement: 0)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &defaultOut, 0, nil, &size, &device) == 0 else { return nil }
+    var volume = Float32(0), muteFlag = UInt32(0)
+    var vSize = UInt32(MemoryLayout<Float32>.size), mSize = UInt32(MemoryLayout<UInt32>.size)
+    var vAddr = address(0x766D7663)    // 'vmvc': the volume the keyboard keys change
+    guard AudioObjectGetPropertyData(device, &vAddr, 0, nil, &vSize, &volume) == 0 else { return nil }
+    var mAddr = address(kAudioDevicePropertyMute)
+    _ = AudioObjectGetPropertyData(device, &mAddr, 0, nil, &mSize, &muteFlag)
+    return (muteFlag != 0 || volume == 0, Double(volume))
+}
+
+/// How many columns the terminal has.
+func columns() -> Int {
+    var size = winsize()
+    return ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) == 0 && size.ws_col > 0 ? Int(size.ws_col) : 80
+}
+
+/// Draws whether the Mac's speakers are muted, so it's plain the sound comes from the trackpad.
+/// The note is cut to fit the terminal: a line that wraps would push the rows below it around.
+func drawSound() {
+    var head = "  Mute your Mac, put it on a table, then move the lid slowly.", note = ""
+    if let s = macSound() {
+        head = s.muted ? "  \(bold)🔇 Mac muted\(plain)" : "  🔊 Mac volume \(Int(s.volume * 100))%"
+        note = s.muted ? " · the sound is the trackpad, not the speakers" : " · mute it to prove it's the trackpad"
+        // 2 spaces, the emoji (2 cells) and a space, the label and the percentage: about 20 cells
+        if 20 + note.count + 2 > columns() { note = "" }
+    }
+    draw(4, note.isEmpty ? head : head + "\(dim)\(note)\(plain)")
+}
+
+var lastMeter = -1
+func drawMeter() {
+    let width = 20, filled = Int(motorPeak * Float(width))
+    motorPeak *= 0.5
+    if filled == lastMeter { return }
+    lastMeter = filled
+    draw(8, "  trackpad ▕\(String(repeating: "█", count: filled))\(String(repeating: "·", count: width - filled))▏ \(dim)motor strength\(plain)")
+}
+
+/// Draws the main screen: the title, the hint, the buttons. The gauge row fills in as the lid is read.
+func drawMain() {
+    out("\u{1B}[2J")
+    lastStatus = ""
+    draw(2, "  \(bold)creakpad\(plain)  \(dim)your lid creaks through the trackpad\(plain)")
+    drawSound()
+    lastMeter = -1
+    drawMeter()
+    draw(10, "  \(dim)It hasn't said anything yet. Close the lid to find out.\(plain)")
+    press = drawButtons(12, [
+        ("q", "quit"), ("s", "settings"),
+        runsInBackground ? ("b", "stop running in the background") : ("b", "keep it running in the background"),
+    ])
+}
+
+var lastStatus = ""
+
+/// Redraws the gauge row when it changed: the lid as a bar, the begging thresholds marked on it.
+/// @param angle - the lid angle
+/// @param state - what is happening, in a few words
+func status(_ angle: Double, _ state: String) {
+    let width = 39    // one cell per 130/39 ≈ 3.3°
+    let filled = Int(min(130, max(0, angle)) / 130 * Double(width))
+    let marks = Set(begging.map { Int($0.below / 130 * Double(width)) })
+    let bar = (0..<width).map { i in i < filled ? "█" : marks.contains(i) ? "┊" : "·" }.joined()
+    let row = "  ▕\(bar)▏ \(String(format: "%3d", Int(angle)))°  \(state)"
+    if row != lastStatus { draw(6, row) }
+    lastStatus = row
+}
+
+/// Says a line, and shows it under the gauge. Right after a start or a new setting, the voice may still be
+/// warming up: the line is then only shown.
+/// @param line - the words
+/// @param angle - the lid angle when it's said
+func say(_ line: String, at angle: Double) {
+    status(angle, "\(cyan)\"\(line)\"\(plain)")
+    draw(10, "  \(dim)It just said\(plain) \"\(line)\"")
+    if let frames = framesFor(line) { talk(frames) }
 }
 
 // MARK: - Main
@@ -733,55 +916,15 @@ let lid = openLid()
 let motor = openMotor()
 motorPointer = Unmanaged.passUnretained(motor as AnyObject).toOpaque()
 
-var press: (Key) -> Character? = { _ in nil }
-
-/// Draws the main screen: the title, the hint, the buttons. The gauge row fills in as the lid is read.
-func drawMain() {
-    out("\u{1B}[2J")
-    lastStatus = ""
-    draw(2, "  \(bold)creakpad\(plain)  \(dim)your lid creaks through the trackpad\(plain)")
-    draw(4, "  Mute your Mac, put it on a table, then move the lid slowly.")
-    draw(8, "  \(dim)It hasn't said anything yet. Close the lid to find out.\(plain)")
-    press = drawButtons(10, [
-        ("q", "quit"), ("s", "settings"),
-        runsInBackground ? ("b", "stop running in the background") : ("b", "keep it running in the background"),
-    ])
-}
-
 prepareVoice()
 enterScreen()
 drawMain()
 
-var lastStatus = ""
-
-/// Redraws the gauge row when it changed: the lid as a bar, the begging thresholds marked on it.
-/// @param angle - the lid angle
-/// @param state - what is happening, in a few words
-func status(_ angle: Double, _ state: String) {
-    let width = 39    // one cell per 130/39 ≈ 3.3°
-    let filled = Int(min(130, max(0, angle)) / 130 * Double(width))
-    let marks = Set(begging.map { Int($0.below / 130 * Double(width)) })
-    let bar = (0..<width).map { i in i < filled ? "█" : marks.contains(i) ? "┊" : "·" }.joined()
-    let row = "  ▕\(bar)▏ \(String(format: "%3d", Int(angle)))°  \(state)"
-    if row != lastStatus { draw(6, row) }
-    lastStatus = row
-}
-
-/// Says a line, and shows it under the gauge. Right after a start or a new setting, the voice may still be
-/// warming up: the line is then only shown.
-/// @param line - the words
-/// @param angle - the lid angle when it's said
-func say(_ line: String, at angle: Double) {
-    status(angle, "\(cyan)\"\(line)\"\(plain)")
-    draw(8, "  \(dim)It just said\(plain) \"\(line)\"")
-    if let frames = framesFor(line) { talk(frames) }
-}
-
 var hinge = Hinge()
-var lastRead = now(), lastDraw = 0.0
+var lastRead = now(), lastDraw = 0.0, lastSound = 0.0
 var said = Set<Int>()       // begging lines already said during this closing
 var wasShut = false
-
+var wasWide = false
 while !stopRequested {
     let t = now()
     if let key = readKey(waiting: 0) {
@@ -802,20 +945,30 @@ while !stopRequested {
         hinge.add(angle, at: t)
         if angle < 8 { wasShut = true }
         if angle > 60 { said.removeAll() }
+        if angle < wideAngle - 15 { wasWide = false }
+
+        if !wasWide, angle >= wideAngle, hinge.velocity > 0 {
+            wasWide = true
+            wasShut = false    // this line replaces the sulk
+            say(pick(wideOpen), at: angle)
+            continue
+        }
 
         if wasShut, angle > 25 {
             wasShut = false
-            say(sulk, at: angle)
+            say(pick(sulk), at: angle)
             continue
         }
+        let steps = begging
         if hinge.velocity < -creakMinSpeed,
-           let i = begging.indices.first(where: { angle < begging[$0].below && !said.contains($0) }) {
+           let i = steps.indices.first(where: { angle < steps[$0].below && !said.contains($0) }) {
             said.formUnion(0...i)    // skip the lines the lid already went past
-            say(begging[i].line, at: angle)
+            say(pick(steps[i].line), at: angle)
             continue
         }
         if t - lastDraw > 0.1 {
             lastDraw = t
+            if t - lastSound > 0.5 { lastSound = t; drawSound() } else { drawMeter() }
             status(angle, abs(hinge.velocity) < creakMinSpeed ? "quiet" : hinge.velocity < 0 ? "▼ creeeak" : "▲ creeeak")
         }
     }
